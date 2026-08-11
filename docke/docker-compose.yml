@@ -1,0 +1,59 @@
+# Horcrux local grid: 1 introducer + 3 storage nodes + 1 client (5 containers).
+# Data persists in named volumes, so the grid and stored files survive
+# docker compose down and PC restarts. Use "down -v" only to destroy the grid.
+services:
+  introducer:
+    build: ./docker
+    container_name: horcrux-introducer
+    hostname: introducer
+    environment: { ROLE: introducer, NODE_NAME: introducer }
+    volumes:
+      - grid:/grid
+      - introducer-data:/var/tahoe/node
+    restart: unless-stopped
+
+  storage1:
+    build: ./docker
+    container_name: horcrux-storage1
+    hostname: storage1
+    environment: { ROLE: storage, NODE_NAME: storage1 }
+    volumes: [ "grid:/grid", "storage1-data:/var/tahoe/node" ]
+    depends_on: [ introducer ]
+    restart: unless-stopped
+
+  storage2:
+    build: ./docker
+    container_name: horcrux-storage2
+    hostname: storage2
+    environment: { ROLE: storage, NODE_NAME: storage2 }
+    volumes: [ "grid:/grid", "storage2-data:/var/tahoe/node" ]
+    depends_on: [ introducer ]
+    restart: unless-stopped
+
+  storage3:
+    build: ./docker
+    container_name: horcrux-storage3
+    hostname: storage3
+    environment: { ROLE: storage, NODE_NAME: storage3 }
+    volumes: [ "grid:/grid", "storage3-data:/var/tahoe/node" ]
+    depends_on: [ introducer ]
+    restart: unless-stopped
+
+  client:
+    build: ./docker
+    container_name: horcrux-client
+    hostname: client
+    environment: { ROLE: client, NODE_NAME: client }
+    ports:
+      - "3456:3456"   # web UI: http://localhost:3456
+    volumes: [ "grid:/grid", "client-data:/var/tahoe/node" ]
+    depends_on: [ storage1, storage2, storage3 ]
+    restart: unless-stopped
+
+volumes:
+  grid:
+  introducer-data:
+  storage1-data:
+  storage2-data:
+  storage3-data:
+  client-data:
