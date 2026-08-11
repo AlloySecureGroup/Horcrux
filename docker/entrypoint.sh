@@ -10,6 +10,12 @@ BASE=/var/tahoe/node
 GRID=/grid
 mkdir -p "$GRID"
 
+# Tahoe records its PID in a lock file. In a container that PID is always 1
+# and PID 1 always exists, so a stale lock from a previous container run
+# makes Tahoe refuse to start forever. Each container runs exactly one node,
+# so clearing it here is safe.
+rm -f "$BASE/running.process.lock"
+
 log() { echo "[horcrux:$NAME] $*"; }
 
 wait_for_furl() {

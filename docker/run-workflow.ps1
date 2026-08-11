@@ -1,24 +1,37 @@
 # Horcrux basic workflow for Windows + Docker Desktop.
-# Run from the repo root:  .\run-workflow.ps1
+# Run from the folder containing docker-compose.yml:  .\run-workflow.ps1
 #
-# What it does, in order:
-#   1. Builds and starts the 5-container grid (introducer, 3 storage, client)
-#   2. Waits until the client sees all 3 storage servers
-#   3. Creates the agentstore alias and saves the rootcap to horcrux-state.json
-#   4. Saves a file into the grid
-#   5. Stops one storage node (simulated failure)
-#   6. Recovers the file with the node still down, and compares byte for byte
-#   7. Restarts the stopped node and repairs shares
-# Everything is logged to workflow.log next to this script.
+# Steps: start 5-container grid, wait for readiness, create the agentstore
+# root and state file, save a file, stop a storage node, recover the file,
+# restart the node, repair shares. Full transcript goes to workflow.log.
+#
+# Note on error handling: docker and tahoe write normal progress to stderr,
+# which strict PowerShell mode turns into fake failures. So this script
+# checks exit codes explicitly instead of using ErrorActionPreference Stop,
+# and routes probes through cmd so stderr never reaches PowerShell.
 
-$ErrorActionPreference = "Stop"
 $LogFile = Join-Path $PSScriptRoot "workflow.log"
 Start-Transcript -Path $LogFile -Append | Out-Null
 
 function Step($msg) { Write-Host ("`n=== " + $msg + " ===") }
-function Fail($msg) { Write-Host ("FAILED: " + $msg); Stop-Transcript | Out-Null; exit 1 }
+function Fail($msg) {
+    Write-Host ("FAILED: " + $msg)
+    Write-Host "`n--- diagnostics: container status ---"
+    docker compose ps
+    foreach ($c in "horcrux-introducer","horcrux-storage1","horcrux-storage2","horcrux-storage3","horcrux-client") {
+        Write-Host ("`n--- last 25 log lines: " + $c + " ---")
+        cmd /c ("docker logs --tail 25 " + $c + " 2>&1")
+    }
+    Write-Host "`nDiagnostics captured above and in workflow.log"
+    Stop-Transcript | Out-Null
+    exit 1
+}
+# Run a command inside the client container, silencing stderr via cmd
+function ClientQuiet($cmdline) {
+    return (cmd /c ("docker exec horcrux-client " + $cmdline + " 2>nul"))
+}
 
-$T = "tahoe", "-d", "/var/tahoe/node"
+$T = "tahoe -d /var/tahoe/node"
 
 Step "1. Starting the grid (5 containers)"
 docker compose up -d --build
@@ -26,22 +39,31 @@ if ($LASTEXITCODE -ne 0) { Fail "docker compose up" }
 
 Step "2. Waiting for the client to see 3 storage servers"
 $connected = 0
-foreach ($i in 1..45) {
-    $connected = docker exec horcrux-client python -c "import json,urllib.request;d=json.load(urllib.request.urlopen('http://127.0.0.1:3456/?t=json'));print(sum(1 for s in d.get('servers',[]) if s.get('connection_status','').lower().startswith('connected')))" 2>$null
-    if ($connected -eq "3") { break }
+foreach ($i in 1..60) {
+    $raw = ClientQuiet "python /check.py"
+    if ($raw) {
+        $last = ("$raw" -split "`n")[-1].Trim()
+        $n = 0
+        if ([int]::TryParse($last, [ref]$n)) { $connected = $n }
+        # non-numeric output means docker exec failed; keep waiting and retry
+    }
+    if ($connected -ge 3) { break }
     Start-Sleep -Seconds 2
 }
-if ($connected -ne "3") { Fail "client never connected to 3 storage servers (see: docker compose logs)" }
-Write-Host "Client connected to 3 storage servers."
+if ($connected -lt 3) { Fail "client never connected to 3 storage servers" }
+Write-Host "Client connected to $connected storage servers."
 
 Step "3. Creating the agentstore root and saving the state file"
-docker exec horcrux-client @T list-aliases 2>$null | Select-String "agentstore" | Out-Null
-if (-not $?) { docker exec horcrux-client @T create-alias agentstore }
-$rootcap = docker exec horcrux-client sh -c "grep '^agentstore:' /var/tahoe/node/private/aliases | cut -d' ' -f2"
-$furl    = docker exec horcrux-client sh -c "cat /grid/introducer.furl"
+$aliases = ClientQuiet "$T list-aliases"
+if ("$aliases" -notmatch "agentstore") {
+    ClientQuiet "$T create-alias agentstore" | Out-Null
+}
+$rootcap = (ClientQuiet "sh -c `"grep '^agentstore:' /var/tahoe/node/private/aliases | cut -d' ' -f2`"")
+$furl    = (ClientQuiet "cat /grid/introducer.furl")
+if (-not $rootcap) { Fail "could not read rootcap (alias creation failed?)" }
 $state = [ordered]@{
-    introducer_furl = $furl.Trim()
-    rootcap         = $rootcap.Trim()
+    introducer_furl = "$furl".Trim()
+    rootcap         = "$rootcap".Trim()
     alias           = "agentstore"
     created         = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 }
@@ -52,11 +74,11 @@ Write-Host "Keep this file safe. It is the only key to the stored data."
 
 Step "4. Saving a file into the grid"
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-docker exec horcrux-client sh -c "echo 'agent artifact saved at $stamp' > /tmp/artifact.txt"
-docker exec horcrux-client @T put /tmp/artifact.txt "agentstore:outputs/artifact.txt"
+ClientQuiet ("sh -c `"echo 'agent artifact saved at " + $stamp + "' > /tmp/artifact.txt`"") | Out-Null
+ClientQuiet "$T put /tmp/artifact.txt agentstore:outputs/artifact.txt" | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "tahoe put" }
-$original = docker exec horcrux-client cat /tmp/artifact.txt
-Write-Host ("Saved: " + $original)
+$original = ClientQuiet "cat /tmp/artifact.txt"
+Write-Host ("Saved: " + "$original".Trim())
 
 Step "5. Simulating failure: stopping storage2"
 docker stop horcrux-storage2 | Out-Null
@@ -64,12 +86,12 @@ Start-Sleep -Seconds 3
 Write-Host "storage2 is down. Grid is running on 2 of 3 nodes."
 
 Step "6. Recovering the file with a node down"
-docker exec horcrux-client @T get "agentstore:outputs/artifact.txt" /tmp/recovered.txt
+ClientQuiet "$T get agentstore:outputs/artifact.txt /tmp/recovered.txt" | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "tahoe get with one node down" }
-$recovered = docker exec horcrux-client cat /tmp/recovered.txt
-docker cp horcrux-client:/tmp/recovered.txt (Join-Path $PSScriptRoot "recovered.txt") | Out-Null
-if ($recovered -eq $original) {
-    Write-Host "RECOVERY OK: recovered file matches the original byte for byte."
+$recovered = ClientQuiet "cat /tmp/recovered.txt"
+cmd /c "docker cp horcrux-client:/tmp/recovered.txt `"$PSScriptRoot\recovered.txt`" 2>nul" | Out-Null
+if ("$recovered".Trim() -eq "$original".Trim() -and "$recovered".Trim().Length -gt 0) {
+    Write-Host "RECOVERY OK: recovered file matches the original."
     Write-Host ("Copied to: " + (Join-Path $PSScriptRoot "recovered.txt"))
 } else {
     Fail "recovered file does not match original"
@@ -77,8 +99,8 @@ if ($recovered -eq $original) {
 
 Step "7. Restoring the grid and repairing shares"
 docker start horcrux-storage2 | Out-Null
-Start-Sleep -Seconds 8
-docker exec horcrux-client @T deep-check --repair --add-lease agentstore:
+Start-Sleep -Seconds 10
+ClientQuiet "$T deep-check --repair --add-lease agentstore:"
 Write-Host "Grid restored to 3 of 3 nodes and shares repaired."
 
 Write-Host "`nAll steps completed. Full log: $LogFile"
